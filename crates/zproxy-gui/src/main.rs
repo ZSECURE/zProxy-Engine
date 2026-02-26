@@ -1,3 +1,6 @@
+// On Windows, use the "windows" subsystem so no console window appears.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 /// zProxy GUI – egui/eframe-based frontend.
 
 #[cfg(feature = "gui")]
@@ -223,6 +226,10 @@ mod gui {
 
     impl eframe::App for ZProxyApp {
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            // Handle Windows system tray events on every frame.
+            #[cfg(windows)]
+            self.handle_tray_events(ctx);
+
             // ---- Top menu bar ----
             egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
                 egui::menu::bar(ui, |ui| {
@@ -343,6 +350,10 @@ mod gui {
                     });
                 ui.end_row();
             });
+
+            // Windows-specific: service management controls
+            #[cfg(windows)]
+            self.show_windows_service_panel(ui);
         }
 
         fn show_proxies(&mut self, ui: &mut egui::Ui) {
@@ -604,9 +615,132 @@ mod gui {
                     });
             });
         }
+
+        // -----------------------------------------------------------------------
+        // Windows-specific: system tray event handler
+        // -----------------------------------------------------------------------
+
+        #[cfg(windows)]
+        fn handle_tray_events(&mut self, ctx: &egui::Context) {
+            use tray_icon::menu::MenuEvent;
+            while let Ok(event) = MenuEvent::receiver().try_recv() {
+                match event.id.0.as_str() {
+                    "zproxy_quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                    "zproxy_show" => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Windows-specific: service management panel (shown inside Dashboard)
+        // -----------------------------------------------------------------------
+
+        #[cfg(windows)]
+        fn show_windows_service_panel(&mut self, ui: &mut egui::Ui) {
+            ui.separator();
+            ui.heading("Windows Service");
+            ui.label("Manage zProxy as a Windows service (requires Administrator).");
+            ui.horizontal(|ui| {
+                if ui.button("Install Service").clicked() {
+                    if let Ok(exe) = std::env::current_exe() {
+                        let path = exe.display().to_string();
+                        match std::process::Command::new("sc")
+                            .args(["create", "zproxy", &format!("binPath={}", path), "start=auto"])
+                            .output()
+                        {
+                            Ok(out) if out.status.success() => {
+                                self.log_lines.push("Service installed successfully (zproxy).".into());
+                            }
+                            Ok(out) => {
+                                let msg = String::from_utf8_lossy(&out.stderr);
+                                self.log_lines.push(format!("Service install failed: {}", msg.trim()));
+                            }
+                            Err(e) => {
+                                self.log_lines.push(format!("Failed to run sc.exe: {}", e));
+                            }
+                        }
+                    }
+                }
+                if ui.button("Start Service").clicked() {
+                    match std::process::Command::new("sc")
+                        .args(["start", "zproxy"])
+                        .output()
+                    {
+                        Ok(out) if out.status.success() => {
+                            self.log_lines.push("Service started successfully.".into());
+                        }
+                        Ok(out) => {
+                            let msg = String::from_utf8_lossy(&out.stderr);
+                            self.log_lines.push(format!("Service start failed: {}", msg.trim()));
+                        }
+                        Err(e) => {
+                            self.log_lines.push(format!("Failed to run sc.exe: {}", e));
+                        }
+                    }
+                }
+                if ui.button("Stop Service").clicked() {
+                    match std::process::Command::new("sc")
+                        .args(["stop", "zproxy"])
+                        .output()
+                    {
+                        Ok(out) if out.status.success() => {
+                            self.log_lines.push("Service stopped successfully.".into());
+                        }
+                        Ok(out) => {
+                            let msg = String::from_utf8_lossy(&out.stderr);
+                            self.log_lines.push(format!("Service stop failed: {}", msg.trim()));
+                        }
+                        Err(e) => {
+                            self.log_lines.push(format!("Failed to run sc.exe: {}", e));
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Windows: system tray icon setup
+    // -----------------------------------------------------------------------
+
+    #[cfg(windows)]
+    fn create_tray_icon() -> tray_icon::TrayIcon {
+        use tray_icon::menu::{Menu, MenuItem};
+        use tray_icon::{Icon, TrayIconBuilder};
+
+        let show_item = MenuItem::with_id("zproxy_show", "Show Window", true, None);
+        let quit_item = MenuItem::with_id("zproxy_quit", "Quit", true, None);
+        let menu = Menu::new();
+        menu.append_items(&[&show_item, &quit_item]).unwrap();
+
+        // Simple 16×16 blue icon (RGBA)
+        let mut rgba = vec![0u8; 16 * 16 * 4];
+        for chunk in rgba.chunks_mut(4) {
+            chunk[0] = 30;   // R
+            chunk[1] = 100;  // G
+            chunk[2] = 200;  // B
+            chunk[3] = 255;  // A
+        }
+        let icon = Icon::from_rgba(rgba, 16, 16).expect("failed to build tray icon");
+
+        TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip("zProxy Engine")
+            .with_icon(icon)
+            .build()
+            .expect("failed to create tray icon")
     }
 
     pub fn run() -> eframe::Result<()> {
+        // Create the system tray icon before the event loop starts.
+        // The binding must remain alive for the entire duration of the app.
+        #[cfg(windows)]
+        let _tray_icon = create_tray_icon();
+
         let options = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_title("zProxy Engine")
