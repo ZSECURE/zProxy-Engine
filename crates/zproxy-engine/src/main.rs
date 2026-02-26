@@ -486,12 +486,16 @@ fn get_process_name_for_peer(_peer: &SocketAddr) -> Option<String> {
 
 /// Generate a unique connection ID using timestamp and a hash.
 fn generate_connection_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now()
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    format!("{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}", t, t & 0xFFFF, t & 0xFFF, t & 0xFFFF, t as u64 * 1_000_003)
+        .unwrap_or_default();
+    let secs = ts.as_secs();
+    let nanos = ts.subsec_nanos();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{:08x}{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}", secs, nanos, seq & 0xFFFF, seq & 0xFFF, seq & 0xFFFF, seq * 1_000_003)
 }
 
 // ---------------------------------------------------------------------------
@@ -500,12 +504,17 @@ fn generate_connection_id() -> String {
 
 #[cfg(windows)]
 fn run_as_service(config: ProxyConfig) -> Result<()> {
+    use std::sync::OnceLock;
     use windows_service::{
         define_windows_service,
         service_dispatcher,
         service::{ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType},
         service_control_handler::{self, ServiceControlHandlerResult},
     };
+
+    // Store config in a global so that service_main (fixed signature) can access it.
+    static SERVICE_CONFIG: OnceLock<ProxyConfig> = OnceLock::new();
+    let _ = SERVICE_CONFIG.set(config);
 
     define_windows_service!(ffi_service_main, service_main);
 
@@ -530,8 +539,7 @@ fn run_as_service(config: ProxyConfig) -> Result<()> {
         }).expect("Failed to set service status");
 
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-        // Load config fresh inside the service thread
-        let svc_config = ProxyConfig::load_from_file("zproxy.xml").unwrap_or_default();
+        let svc_config = SERVICE_CONFIG.get().cloned().unwrap_or_default();
         let _ = rt.block_on(run_proxy_server(svc_config));
     }
 
