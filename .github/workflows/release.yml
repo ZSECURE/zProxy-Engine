@@ -30,6 +30,9 @@ jobs:
           - target: x86_64-pc-windows-gnu
             os: ubuntu-latest
             gui: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            gui: true
     steps:
       - uses: actions/checkout@v4
 
