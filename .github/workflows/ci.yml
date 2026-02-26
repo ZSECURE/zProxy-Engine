@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, "copilot/**" ]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+      - name: Install system dependencies
+        run: sudo apt-get install -y libxkbcommon-dev libwayland-dev libxkbcommon-x11-0
+      - name: Build (no GUI)
+        run: cargo build --workspace --exclude zproxy-gui
+      - name: Test
+        run: cargo test --workspace --exclude zproxy-gui
+      - name: Build GUI
+        run: cargo build -p zproxy-gui --features gui
+
+  windows-cross:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - name: Install mingw
+        run: sudo apt-get install -y gcc-mingw-w64-x86-64
+      - name: Build for Windows
+        run: cargo build -p zproxy-engine --target x86_64-pc-windows-gnu
