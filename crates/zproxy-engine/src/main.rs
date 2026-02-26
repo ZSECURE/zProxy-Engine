@@ -21,6 +21,16 @@ use zproxy_core::{
 };
 
 // ---------------------------------------------------------------------------
+// SOCKS5 reply codes
+// ---------------------------------------------------------------------------
+
+const SOCKS5_AUTH_NO_AUTH: u8 = 0x00;
+const SOCKS5_AUTH_NO_ACCEPTABLE: u8 = 0xFF;
+const SOCKS5_REP_SUCCEEDED: u8 = 0x00;
+const SOCKS5_REP_CONNECTION_REFUSED: u8 = 0x05;
+const SOCKS5_REP_CMD_NOT_SUPPORTED: u8 = 0x07;
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -289,7 +299,7 @@ async fn send_inbound_success(proto: &InboundProtocol, stream: &mut TcpStream) -
 
 async fn send_inbound_error(proto: &InboundProtocol, stream: &mut TcpStream) -> Result<()> {
     match proto {
-        InboundProtocol::Socks5 => send_socks5_error(stream, 0x05).await, // connection refused
+        InboundProtocol::Socks5 => send_socks5_error(stream, SOCKS5_REP_CONNECTION_REFUSED).await, // connection refused
         InboundProtocol::Socks4 => send_socks4_error(stream).await,
         InboundProtocol::Http => {
             stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n").await?;
@@ -342,10 +352,10 @@ async fn parse_socks5_request(stream: &mut TcpStream) -> Result<(String, u16)> {
     stream.read_exact(&mut methods).await?;
 
     // Select no-auth (0x00) only if the client offered it; otherwise reject.
-    if methods.contains(&0x00) {
-        stream.write_all(&[5u8, 0x00]).await?;
+    if methods.contains(&SOCKS5_AUTH_NO_AUTH) {
+        stream.write_all(&[5u8, SOCKS5_AUTH_NO_AUTH]).await?;
     } else {
-        stream.write_all(&[5u8, 0xFF]).await?;
+        stream.write_all(&[5u8, SOCKS5_AUTH_NO_ACCEPTABLE]).await?;
         stream.shutdown().await?;
         return Err(anyhow::anyhow!(
             "SOCKS5: no acceptable auth methods (client offered: {:?})",
@@ -361,7 +371,7 @@ async fn parse_socks5_request(stream: &mut TcpStream) -> Result<(String, u16)> {
     }
     if req_head[1] != 0x01 {
         // We only support CONNECT
-        send_socks5_error(stream, 0x07).await?;
+        send_socks5_error(stream, SOCKS5_REP_CMD_NOT_SUPPORTED).await?;
         return Err(anyhow::anyhow!("SOCKS5: unsupported command 0x{:02X}", req_head[1]));
     }
 
@@ -400,7 +410,7 @@ async fn parse_socks5_addr(stream: &mut TcpStream, atyp: u8) -> Result<(String, 
 async fn send_socks5_success(stream: &mut TcpStream) -> Result<()> {
     // VER REP RSV ATYP BND.ADDR(4) BND.PORT(2)
     stream
-        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .write_all(&[0x05, SOCKS5_REP_SUCCEEDED, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
         .await?;
     Ok(())
 }

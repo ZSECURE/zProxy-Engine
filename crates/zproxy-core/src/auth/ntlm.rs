@@ -497,10 +497,17 @@ mod tests {
 
     #[test]
     fn test_des_key_expansion() {
-        let key7 = [0u8; 7];
-        let key8 = expand_des_key(&key7);
         // All-zero 7-byte key: after expanding and setting odd parity,
         // each byte has count_ones() == 0 (even), so parity bit is set to 1.
+        let key7 = [0u8; 7];
+        let key8 = expand_des_key(&key7);
         assert!(key8.iter().all(|&b| b == 0x01));
+
+        // Non-zero input: verify each output byte has odd parity.
+        let key7_nonzero = [0x13u8, 0x34, 0x57, 0x79, 0x9B, 0xBC, 0xDF];
+        let key8_nonzero = expand_des_key(&key7_nonzero);
+        for byte in key8_nonzero.iter() {
+            assert_eq!(byte.count_ones() % 2, 1, "byte 0x{:02x} does not have odd parity", byte);
+        }
     }
 }
