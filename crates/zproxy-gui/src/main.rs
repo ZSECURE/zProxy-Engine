@@ -42,6 +42,7 @@ mod gui {
 
     #[derive(Default, Clone)]
     struct EditProxy {
+        original_id: String, // ID when editing started (empty for new proxies)
         id: String,
         protocol: String,
         host: String,
@@ -63,6 +64,7 @@ mod gui {
                 AuthMethod::Ntlm { username, password, domain } => ("ntlm".into(), username.clone(), password.clone(), domain.clone()),
             };
             EditProxy {
+                original_id: s.id.clone(),
                 id: s.id.clone(),
                 protocol: s.protocol.as_str().to_string(),
                 host: s.host.clone(),
@@ -96,6 +98,7 @@ mod gui {
 
     #[derive(Default, Clone)]
     struct EditRule {
+        original_id: String, // ID when editing started (empty for new rules)
         id: String,
         name: String,
         host_pattern: String,
@@ -108,6 +111,7 @@ mod gui {
     impl EditRule {
         fn from_rule(r: &Rule) -> Self {
             EditRule {
+                original_id: r.id.clone(),
                 id: r.id.clone(),
                 name: r.name.clone(),
                 host_pattern: r.host_pattern.clone().unwrap_or_default(),
@@ -426,7 +430,7 @@ mod gui {
                                 if let Some(server) = ep.to_server() {
                                     if self.new_proxy {
                                         self.config.servers.push(server);
-                                    } else if let Some(pos) = self.config.servers.iter().position(|s| s.id == server.id) {
+                                    } else if let Some(pos) = self.config.servers.iter().position(|s| s.id == ep.original_id) {
                                         self.config.servers[pos] = server;
                                     }
                                 }
@@ -501,7 +505,7 @@ mod gui {
                                 if let Some(rule) = er.to_rule() {
                                     if self.new_rule {
                                         self.config.rules.push(rule);
-                                    } else if let Some(pos) = self.config.rules.iter().position(|r| r.id == rule.id) {
+                                    } else if let Some(pos) = self.config.rules.iter().position(|r| r.id == er.original_id) {
                                         self.config.rules[pos] = rule;
                                     }
                                 }

@@ -5,7 +5,8 @@
 ///   Type 2 – Challenge  (server → client)
 ///   Type 3 – Authenticate (client → server)
 ///
-/// The NT response uses NTLMv1 (NTHash + DES3-CBC over the server challenge).
+/// The NT response uses the NTLMv1 "NT response" scheme (NTHash + three
+/// independent single-block DES ECB encryptions of the 8-byte server challenge).
 /// This is intentionally kept simple; real deployments should use NTLMv2.
 
 use anyhow::{anyhow, Result};
@@ -276,7 +277,12 @@ fn expand_des_key(key7: &[u8]) -> [u8; 8] {
     key8[6] = ((key7[5] & 0x3F) << 1) | (key7[6] >> 7);
     key8[7] = key7[6] & 0x7F;
     for b in &mut key8 {
+        // Shift so the 7 key bits occupy bits 7–1; bit 0 is the parity bit.
         *b <<= 1;
+        // Adjust bit 0 to ensure odd parity (XOR of all bits == 1).
+        if b.count_ones() % 2 == 0 {
+            *b ^= 0x01;
+        }
     }
     key8
 }
@@ -493,7 +499,8 @@ mod tests {
     fn test_des_key_expansion() {
         let key7 = [0u8; 7];
         let key8 = expand_des_key(&key7);
-        // All zeros expanded should remain all zeros
-        assert_eq!(key8, [0u8; 8]);
+        // All-zero 7-byte key: after expanding and setting odd parity,
+        // each byte has count_ones() == 0 (even), so parity bit is set to 1.
+        assert!(key8.iter().all(|&b| b == 0x01));
     }
 }

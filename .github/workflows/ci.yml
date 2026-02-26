@@ -30,8 +30,7 @@ jobs:
       - name: Test
         run: cargo test --workspace --exclude zproxy-gui
       - name: Build GUI
-        run: cargo build -p zproxy-gui --no-default-features
-        continue-on-error: true
+        run: cargo build -p zproxy-gui --features gui
 
   windows-cross:
     runs-on: ubuntu-latest

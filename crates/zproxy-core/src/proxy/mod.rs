@@ -16,9 +16,8 @@ pub async fn connect_through_proxy(
     target_port: u16,
 ) -> Result<TcpStream> {
     let connect_timeout = Duration::from_secs(proxy.timeout_secs);
-    let addr = format!("{}:{}", proxy.host, proxy.port);
-
-    let mut stream = timeout(connect_timeout, TcpStream::connect(&addr)).await??;
+    // Use tuple form so that IPv6 host strings (e.g. "::1") are handled correctly.
+    let mut stream = timeout(connect_timeout, TcpStream::connect((proxy.host.as_str(), proxy.port))).await??;
 
     match proxy.protocol {
         ProxyProtocol::Socks4 => {

@@ -107,6 +107,46 @@ fn wildcard_to_regex(pattern: &str) -> Result<Regex> {
 }
 
 // ---------------------------------------------------------------------------
+// CompiledRules – pre-sorted and pre-compiled for efficient hot-path lookups
+// ---------------------------------------------------------------------------
+
+/// Pre-sorted, pre-compiled set of rules for efficient per-connection lookup.
+///
+/// Build once at startup via [`CompiledRules::new`], then reuse for every
+/// connection to avoid per-connection regex compilation and Vec allocations.
+pub struct CompiledRules {
+    matchers: Vec<RuleMatcher>, // sorted by descending priority
+}
+
+impl CompiledRules {
+    /// Compile and sort a slice of rules.
+    pub fn new(rules: &[Rule]) -> Result<Self> {
+        let mut matchers: Vec<RuleMatcher> = rules
+            .iter()
+            .map(RuleMatcher::new)
+            .collect::<Result<Vec<_>>>()?;
+        matchers.sort_by(|a, b| b.rule().priority.cmp(&a.rule().priority));
+        Ok(CompiledRules { matchers })
+    }
+
+    /// Find the first matching rule for the given connection attributes.
+    pub fn find_match(
+        &self,
+        host: &str,
+        process: Option<&str>,
+        port: Option<u16>,
+    ) -> Option<&Rule> {
+        self.matchers.iter().find_map(|m| {
+            if m.matches(host, process, port) {
+                Some(m.rule())
+            } else {
+                None
+            }
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Rule lookup
 // ---------------------------------------------------------------------------
 
@@ -228,5 +268,38 @@ mod tests {
         ];
         let result = find_matching_rule(&rules, "evil.blocked.com", None, None);
         assert_eq!(result.unwrap().id, "high");
+    }
+
+    #[test]
+    fn test_compiled_rules_precompiled() {
+        use crate::config::{Rule, RuleAction};
+        let rules = vec![
+            Rule {
+                id: "low".into(),
+                name: "catch-all".into(),
+                host_pattern: Some("*".into()),
+                process_pattern: None,
+                port: None,
+                action: RuleAction::Direct,
+                priority: 1,
+            },
+            Rule {
+                id: "high".into(),
+                name: "block bad".into(),
+                host_pattern: Some("*.bad.com".into()),
+                process_pattern: None,
+                port: None,
+                action: RuleAction::Block,
+                priority: 50,
+            },
+        ];
+        let compiled = CompiledRules::new(&rules).unwrap();
+        // High priority rule should win
+        assert_eq!(compiled.find_match("evil.bad.com", None, None).unwrap().id, "high");
+        // Low priority catch-all should win when no specific rule matches
+        assert_eq!(compiled.find_match("safe.example.com", None, None).unwrap().id, "low");
+        // No match when neither pattern fits
+        let empty = CompiledRules::new(&[]).unwrap();
+        assert!(empty.find_match("anything.com", None, None).is_none());
     }
 }

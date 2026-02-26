@@ -16,7 +16,7 @@ use zproxy_core::{
     checker,
     config::{ProxyConfig, RuleAction},
     proxy::{chain, connect_through_proxy},
-    rules::find_matching_rule,
+    rules::CompiledRules,
     stats::{ConnectionInfo, GlobalStats},
 };
 
@@ -125,12 +125,23 @@ async fn run_check(config: &ProxyConfig) {
 // ---------------------------------------------------------------------------
 
 async fn run_proxy_server(config: ProxyConfig) -> Result<()> {
-    let listen_addr = format!(
-        "{}:{}",
-        config.settings.listen_host, config.settings.listen_port
+    // Use the tuple form so IPv6 listen hosts (e.g. "::1") work correctly.
+    let listener = TcpListener::bind((
+        config.settings.listen_host.as_str(),
+        config.settings.listen_port,
+    ))
+    .await?;
+    let local_addr = listener.local_addr()?;
+    info!("zProxy listening on {}", local_addr);
+
+    // Precompile rules once at startup to avoid per-connection allocations.
+    let compiled_rules = Arc::new(
+        CompiledRules::new(&config.rules)
+            .unwrap_or_else(|e| {
+                warn!("Failed to compile rules: {}. No rules will be applied.", e);
+                CompiledRules::new(&[]).expect("empty rules always compile")
+            })
     );
-    let listener = TcpListener::bind(&listen_addr).await?;
-    info!("zProxy listening on {}", listen_addr);
 
     let config = Arc::new(config);
     let stats = GlobalStats::new();
@@ -139,9 +150,10 @@ async fn run_proxy_server(config: ProxyConfig) -> Result<()> {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let cfg = Arc::clone(&config);
+                let rules = Arc::clone(&compiled_rules);
                 let st = Arc::clone(&stats);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, peer, cfg, st).await {
+                    if let Err(e) = handle_connection(stream, peer, cfg, rules, st).await {
                         error!("Connection error from {}: {}", peer, e);
                     }
                 });
@@ -154,6 +166,16 @@ async fn run_proxy_server(config: ProxyConfig) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Inbound protocol tracker
+// ---------------------------------------------------------------------------
+
+enum InboundProtocol {
+    Socks4,
+    Socks5,
+    Http,
+}
+
+// ---------------------------------------------------------------------------
 // Connection handler
 // ---------------------------------------------------------------------------
 
@@ -161,20 +183,28 @@ async fn handle_connection(
     mut stream: TcpStream,
     peer: SocketAddr,
     config: Arc<ProxyConfig>,
+    compiled_rules: Arc<CompiledRules>,
     stats: Arc<GlobalStats>,
 ) -> Result<()> {
     // Peek at the first byte to decide the protocol
     let mut peek = [0u8; 1];
     stream.peek(&mut peek).await?;
 
-    let (target_host, target_port) = match peek[0] {
+    let (inbound_proto, target_host, target_port) = match peek[0] {
         // SOCKS5: version byte = 5
-        5 => parse_socks5_request(&mut stream).await?,
+        5 => {
+            let (h, p) = parse_socks5_request(&mut stream).await?;
+            (InboundProtocol::Socks5, h, p)
+        }
         // SOCKS4: version byte = 4
-        4 => parse_socks4_request(&mut stream).await?,
+        4 => {
+            let (h, p) = parse_socks4_request(&mut stream).await?;
+            (InboundProtocol::Socks4, h, p)
+        }
         // HTTP: 'C' = CONNECT, 'G' = GET, 'P' = POST/PUT, etc.
         b'C' | b'G' | b'P' | b'H' | b'D' | b'O' | b'T' => {
-            parse_http_connect_request(&mut stream).await?
+            let (h, p) = parse_http_connect_request(&mut stream).await?;
+            (InboundProtocol::Http, h, p)
         }
         b => return Err(anyhow::anyhow!("Unknown proxy protocol byte: 0x{:02X}", b)),
     };
@@ -183,8 +213,7 @@ async fn handle_connection(
 
     // --- Rule matching ---
     let process_name = get_process_name_for_peer(&peer);
-    let rule = find_matching_rule(
-        &config.rules,
+    let rule = compiled_rules.find_match(
         &target_host,
         process_name.as_deref(),
         Some(target_port),
@@ -206,28 +235,37 @@ async fn handle_connection(
     };
     stats.add_connection(conn_info);
 
+    // Attempt to establish upstream, then send the appropriate inbound response.
     let result = match &action {
         RuleAction::Block => {
             info!("Blocking {}:{}", target_host, target_port);
+            // Send a protocol-appropriate rejection before closing.
+            let _ = send_inbound_error(&inbound_proto, &mut stream).await;
             Err(anyhow::anyhow!("Blocked by rule"))
         }
         RuleAction::Direct => {
-            let addr = format!("{}:{}", target_host, target_port);
-            match TcpStream::connect(&addr).await {
+            // Use tuple form for correct IPv6 handling.
+            match TcpStream::connect((target_host.as_str(), target_port)).await {
                 Ok(upstream) => {
-                    send_socks5_success(&mut stream).await?;
+                    send_inbound_success(&inbound_proto, &mut stream).await?;
                     pipe_streams(stream, upstream, &stats, &conn_id).await
                 }
-                Err(e) => Err(anyhow::anyhow!("Direct connect failed: {}", e)),
+                Err(e) => {
+                    let _ = send_inbound_error(&inbound_proto, &mut stream).await;
+                    Err(anyhow::anyhow!("Direct connect failed: {}", e))
+                }
             }
         }
         RuleAction::Proxy(chain_id) => {
             match resolve_and_connect(&config, chain_id, &target_host, target_port).await {
                 Ok(upstream) => {
-                    send_socks5_success(&mut stream).await?;
+                    send_inbound_success(&inbound_proto, &mut stream).await?;
                     pipe_streams(stream, upstream, &stats, &conn_id).await
                 }
-                Err(e) => Err(e),
+                Err(e) => {
+                    let _ = send_inbound_error(&inbound_proto, &mut stream).await;
+                    Err(e)
+                }
             }
         }
     };
@@ -235,6 +273,29 @@ async fn handle_connection(
     stats.remove_connection(&conn_id);
 
     result
+}
+
+// ---------------------------------------------------------------------------
+// Protocol-aware inbound response helpers
+// ---------------------------------------------------------------------------
+
+async fn send_inbound_success(proto: &InboundProtocol, stream: &mut TcpStream) -> Result<()> {
+    match proto {
+        InboundProtocol::Socks5 => send_socks5_success(stream).await,
+        InboundProtocol::Socks4 => send_socks4_success(stream).await,
+        InboundProtocol::Http => send_http_success(stream).await,
+    }
+}
+
+async fn send_inbound_error(proto: &InboundProtocol, stream: &mut TcpStream) -> Result<()> {
+    match proto {
+        InboundProtocol::Socks5 => send_socks5_error(stream, 0x05).await, // connection refused
+        InboundProtocol::Socks4 => send_socks4_error(stream).await,
+        InboundProtocol::Http => {
+            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n").await?;
+            Ok(())
+        }
+    }
 }
 
 /// Resolve a chain or single server ID and connect.
@@ -280,8 +341,17 @@ async fn parse_socks5_request(stream: &mut TcpStream) -> Result<(String, u16)> {
     let mut methods = vec![0u8; nmethods];
     stream.read_exact(&mut methods).await?;
 
-    // We always respond with no-auth (0x00)
-    stream.write_all(&[5u8, 0x00]).await?;
+    // Select no-auth (0x00) only if the client offered it; otherwise reject.
+    if methods.contains(&0x00) {
+        stream.write_all(&[5u8, 0x00]).await?;
+    } else {
+        stream.write_all(&[5u8, 0xFF]).await?;
+        stream.shutdown().await?;
+        return Err(anyhow::anyhow!(
+            "SOCKS5: no acceptable auth methods (client offered: {:?})",
+            methods
+        ));
+    }
 
     // Request: VER CMD RSV ATYP ...
     let mut req_head = [0u8; 4];
@@ -372,9 +442,20 @@ async fn parse_socks4_request(stream: &mut TcpStream) -> Result<(String, u16)> {
         std::net::Ipv4Addr::from(ip).to_string()
     };
 
-    // Send granted response
-    stream.write_all(&[0x00, 0x5A, 0, 0, 0, 0, 0, 0]).await?;
+    // Response is sent by handle_connection after upstream connect attempt.
     Ok((host, port))
+}
+
+async fn send_socks4_success(stream: &mut TcpStream) -> Result<()> {
+    // VN=0 CD=0x5A (granted) PORT=0 IP=0.0.0.0
+    stream.write_all(&[0x00, 0x5A, 0, 0, 0, 0, 0, 0]).await?;
+    Ok(())
+}
+
+async fn send_socks4_error(stream: &mut TcpStream) -> Result<()> {
+    // VN=0 CD=0x5B (rejected/failed)
+    stream.write_all(&[0x00, 0x5B, 0, 0, 0, 0, 0, 0]).await?;
+    Ok(())
 }
 
 async fn read_nul_string(stream: &mut TcpStream) -> Result<String> {
@@ -422,14 +503,30 @@ async fn parse_http_connect_request(stream: &mut TcpStream) -> Result<(String, u
         return Err(anyhow::anyhow!("HTTP: only CONNECT is supported (got {})", method));
     }
 
-    let (host, port) = parse_host_port(target)?;
-
-    // Send 200 Connection Established
-    stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
-    Ok((host, port))
+    // Response (200) is sent by handle_connection after upstream connect succeeds.
+    parse_host_port(target)
 }
 
+async fn send_http_success(stream: &mut TcpStream) -> Result<()> {
+    stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+    Ok(())
+}
+
+/// Parse `host:port` or `[ipv6]:port` from an HTTP CONNECT target string.
 fn parse_host_port(target: &str) -> Result<(String, u16)> {
+    // Handle bracketed IPv6: [2001:db8::1]:443
+    if target.starts_with('[') {
+        if let Some(bracket_end) = target.find(']') {
+            let host = target[1..bracket_end].to_string();
+            let rest = &target[bracket_end + 1..];
+            if let Some(port_str) = rest.strip_prefix(':') {
+                let port: u16 = port_str.parse()?;
+                return Ok((host, port));
+            }
+            return Err(anyhow::anyhow!("No port in IPv6 CONNECT target: {}", target));
+        }
+    }
+    // Plain host:port (IPv4 or hostname)
     if let Some(pos) = target.rfind(':') {
         let host = target[..pos].to_string();
         let port: u16 = target[pos + 1..].parse()?;
@@ -484,7 +581,7 @@ fn get_process_name_for_peer(_peer: &SocketAddr) -> Option<String> {
     None
 }
 
-/// Generate a unique connection ID using timestamp and a hash.
+/// Generate a unique connection ID using full timestamp + monotonic counter.
 fn generate_connection_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -545,4 +642,39 @@ fn run_as_service(config: ProxyConfig) -> Result<()> {
 
     service_dispatcher::start("zproxy", ffi_service_main)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_host_port_ipv4() {
+        let (h, p) = parse_host_port("example.com:443").unwrap();
+        assert_eq!(h, "example.com");
+        assert_eq!(p, 443);
+    }
+
+    #[test]
+    fn test_parse_host_port_ipv6_bracketed() {
+        let (h, p) = parse_host_port("[2001:db8::1]:443").unwrap();
+        assert_eq!(h, "2001:db8::1");
+        assert_eq!(p, 443);
+    }
+
+    #[test]
+    fn test_parse_host_port_ipv6_loopback() {
+        let (h, p) = parse_host_port("[::1]:8080").unwrap();
+        assert_eq!(h, "::1");
+        assert_eq!(p, 8080);
+    }
+
+    #[test]
+    fn test_parse_host_port_no_port() {
+        assert!(parse_host_port("example.com").is_err());
+    }
 }

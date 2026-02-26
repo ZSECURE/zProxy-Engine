@@ -1,6 +1,6 @@
 # zProxy-Engine
 
-A lightweight, feature-rich proxy client written in Rust for Windows (and cross-platform compilation). Tunnels TCP/UDP connections through SOCKS4, SOCKS4A, SOCKS5, HTTP, and HTTPS proxies with flexible rule-based routing, proxy chaining, NTLM authentication, and a GUI.
+A lightweight, feature-rich proxy client written in Rust for Windows (and cross-platform compilation). Tunnels TCP connections through SOCKS4, SOCKS4A, SOCKS5, HTTP, and HTTPS proxies with flexible rule-based routing, proxy chaining, NTLM authentication, and a GUI.
 
 ## Features
 
@@ -13,11 +13,13 @@ A lightweight, feature-rich proxy client written in Rust for Windows (and cross-
 - **Proxy Checker**: Concurrent reachability and latency checks for all configured proxies
 - **Connection Statistics**: Real-time bandwidth usage, active connections, per-host stats
 - **Structured Logging**: JSON-lines log files with traffic dump support (TRACE level)
-- **Full IPv6 Support**: Throughout all protocol and connection handling code
+- **IPv6 Support**: SOCKS5 address type 0x04 (IPv6), bracketed `[::1]:port` HTTP CONNECT targets, IPv6 listener binding
 - **GUI**: egui/eframe tabbed interface — Dashboard, Proxies, Rules, Logs, Stats, Checker
 - **Windows Service**: Run as a Windows background service (Windows only, via `windows-service`)
 - **XML Configuration**: Human-readable `zproxy.xml` with proxy servers, chains, rules, and settings
 - **Build Tool**: Helper binary (`zproxy-build`) for easy cross-compilation targeting Windows
+
+> **Note**: The current implementation tunnels TCP connections. UDP proxying is not yet implemented.
 
 ## Workspace Structure
 
@@ -98,6 +100,7 @@ zproxy.exe --service
 ### Sample XML Configuration
 
 ```xml
+<?xml version="1.0" encoding="UTF-8"?>
 <zproxy>
   <settings>
     <listen_host>127.0.0.1</listen_host>
@@ -110,43 +113,27 @@ zproxy.exe --service
   </settings>
 
   <servers>
-    <server>
-      <id>proxy1</id>
-      <protocol>socks5</protocol>
-      <host>192.168.1.100</host>
-      <port>1080</port>
-      <auth type="userpass">
-        <username>user</username>
-        <password>pass</password>
-      </auth>
-      <enabled>true</enabled>
-      <timeout_secs>30</timeout_secs>
+    <server id="proxy1" protocol="socks5" host="192.168.1.100" port="1080"
+            enabled="true" timeout_secs="30">
+      <auth type="userpass" username="user" password="pass"/>
+    </server>
+    <server id="http1" protocol="http" host="10.0.0.1" port="8080"
+            enabled="true" timeout_secs="30">
+      <auth type="ntlm" username="DOMAIN\user" password="pass" domain="CORP"/>
     </server>
   </servers>
 
   <chains>
-    <chain>
-      <id>chain1</id>
-      <name>Main Chain</name>
-      <servers>proxy1</servers>
+    <chain id="chain1" name="Main Chain">
+      <server_ref id="proxy1"/>
     </chain>
   </chains>
 
   <rules>
-    <rule>
-      <id>rule1</id>
-      <name>All *.example.com via proxy</name>
-      <host_pattern>*.example.com</host_pattern>
-      <action>proxy:chain1</action>
-      <priority>10</priority>
-    </rule>
-    <rule>
-      <id>rule2</id>
-      <name>Block ads</name>
-      <host_pattern>*ads*.doubleclick.net</host_pattern>
-      <action>block</action>
-      <priority>5</priority>
-    </rule>
+    <rule id="rule1" name="All *.example.com via proxy"
+          host_pattern="*.example.com" action="proxy:chain1" priority="10"/>
+    <rule id="rule2" name="Block ads"
+          host_pattern="*ads*.doubleclick.net" action="block" priority="5"/>
   </rules>
 </zproxy>
 ```

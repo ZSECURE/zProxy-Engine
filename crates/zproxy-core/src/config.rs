@@ -180,8 +180,8 @@ pub struct ProxyConfig {
 // ProxyConfig implementation
 // ---------------------------------------------------------------------------
 
-impl ProxyConfig {
-    pub fn default() -> Self {
+impl Default for ProxyConfig {
+    fn default() -> Self {
         ProxyConfig {
             servers: Vec::new(),
             chains: Vec::new(),
@@ -189,6 +189,9 @@ impl ProxyConfig {
             settings: Settings::default(),
         }
     }
+}
+
+impl ProxyConfig {
 
     pub fn find_server(&self, id: &str) -> Option<&ProxyServer> {
         self.servers.iter().find(|s| s.id == id)
